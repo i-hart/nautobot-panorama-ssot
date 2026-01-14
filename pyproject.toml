@@ -5,8 +5,8 @@ description = "Nautobot SSoT integration for Palo Alto Panorama"
 authors = ["jmh <jmh.devnet@gmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/yourusername/nautobot-panorama-ssot"
-repository = "https://github.com/yourusername/nautobot-panorama-ssot"
+homepage = "https://github.com/i-hart/nautobot-panorama-ssot"
+repository = "https://github.com/i-hart/nautobot-panorama-ssot"
 keywords = ["nautobot", "nautobot-app", "nautobot-plugin"]
 classifiers = [
     "Intended Audience :: Developers",
