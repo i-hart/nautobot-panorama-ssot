@@ -1,29 +1,42 @@
 """Constants for use with the Panorama SSoT app."""
 
-# Tag color for SSoT synced objects
+# ==========================================================
+# VISUAL / TAGGING
+# ==========================================================
+
 TAG_COLOR = "FA582D"
 
-# Default configuration values
+# ==========================================================
+# PANORAMA DEFAULTS
+# ==========================================================
+
 DEFAULT_DEVICE_GROUP = "shared"
 DEFAULT_TEMPLATE = "BASE"
 DEFAULT_REQUEST_TIMEOUT = 60
 DEFAULT_STATUS_NAME = "Active"
 
-# Environment variable names
+PANORAMA_API_VERSION = "v11.1"
+PANORAMA_API_PATH = "/api/"
+
+# ==========================================================
+# ENV VARS
+# ==========================================================
+
 ENV_VAR_USERNAME = "NAUTOBOT_PANORAMA_SSOT_USERNAME"
 ENV_VAR_TOKEN = "NAUTOBOT_PANORAMA_SSOT_TOKEN"
 ENV_VAR_URL = "NAUTOBOT_PANORAMA_SSOT_URL"
 
-# Panorama API defaults
-PANORAMA_API_VERSION = "v11.1"
-PANORAMA_API_PATH = "/api/"
-CHANGE_WINDOW_ONLY = True
-ALLOWED_HOURS = (16, 20)  # 4PM–8PM
+# ==========================================================
+# RUNTIME DEFAULTS (SAFE)
+# ==========================================================
 
-DRIFT_ONLY = True
-ALLOW_DELETE = False
-SIMULATION_MODE = False
-AUTO_REORDER = False
+DEFAULT_CHANGE_WINDOW_ONLY = False
+DEFAULT_ALLOWED_HOURS = (0, 23)
 
-SAFE_COMMIT_MODE = "advisory"  # or "enforce"
-SAFE_COMMIT_THRESHOLD = 70
+DEFAULT_DRIFT_ONLY = False
+DEFAULT_ALLOW_DELETE = False
+DEFAULT_SIMULATION_MODE = False
+DEFAULT_AUTO_REORDER = False
+
+DEFAULT_SAFE_COMMIT_MODE = "advisory"
+DEFAULT_SAFE_COMMIT_THRESHOLD = 70
