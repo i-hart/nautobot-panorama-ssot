@@ -86,12 +86,18 @@ class PanoramaAdapter(DiffSync):
             timeout=timeout,
         )
 
-        self.forward = None
+#        self.forward = None
         if forward_creds:
             self.forward = ForwardClient(
                 base_url=forward_creds["base_url"],
                 token=forward_creds["token"],
             )
+        else:
+            self.forward = None
+            self.query_lib = None
+
+        self._forward_snapshot_id = None
+        self._forward_snapshot_timestamp = None
 
         self.touched_device_groups = set()
         self.audit = DriftAudit()
@@ -106,6 +112,110 @@ class PanoramaAdapter(DiffSync):
         self.enable_blast_radius = enable_blast_radius
         self.enable_risk_scoring = enable_risk_scoring
         self.enable_rule_optimizer = enable_rule_optimizer
+
+
+    # ===========================================================
+    # FORWARD NETWORKS HELPERS
+    # ===========================================================
+    def _get_forward_snapshot(self, force=False, ttl=600):
+        """
+        Cache Forward snapshot for ttl seconds.
+        """
+        now = datetime.datetime.utcnow().timestamp()
+    
+        if (
+            not force
+            and self._forward_snapshot_id
+            and (now - self._forward_snapshot_timestamp) < ttl
+        ):
+            return self._forward_snapshot_id
+    
+        snapshot = self.forward.trigger_snapshot()
+        snapshot_id = snapshot["id"]
+        self.forward.wait_for_snapshot(snapshot_id)
+    
+        self._forward_snapshot_id = snapshot_id
+        self._forward_snapshot_timestamp = now
+    
+        return snapshot_id
+
+    def _run_compliance_checks(self):
+    
+        failures = {}
+    
+        for framework, queries in COMPLIANCE_QUERY_MAP.items():
+            for q in queries:
+                results = self.forward.run_nqe(q)
+                if results:
+                    failures.setdefault(framework, []).append(q)
+    
+        return failures
+
+    def _simulate_policy_diff(self, dg):
+    
+        before_rules = self.client.get_security_rules(dg, "pre")
+        after_rules = self.client.get_security_rules(dg, "post")
+    
+        before_names = {r["@name"] for r in before_rules}
+        after_names = {r["@name"] for r in after_rules}
+    
+        added = after_names - before_names
+        removed = before_names - after_names
+    
+        return {
+            "added": list(added),
+            "removed": list(removed),
+        }
+
+    def _monitor_commit(self, job_id: str, timeout: int = 900):
+        start = time.time()
+    
+        while time.time() - start < timeout:
+            status = self.client.get_commit_status(job_id)
+    
+            if status == "FIN":
+                self.logger.info("Panorama commit completed successfully")
+                return
+    
+            if status == "FAIL":
+                raise RuntimeError("Panorama commit failed")
+    
+            time.sleep(5)
+    
+        raise TimeoutError("Panorama commit timed out")
+
+    def _record_risk_trend(self, dg, rule_name, risk_score):
+    
+        self.audit.record(
+            "risk_score",
+            "rule",
+            rule_name,
+            dg,
+            extra={
+                "score": risk_score,
+                "timestamp": datetime.datetime.utcnow().isoformat(),
+            },
+        )
+
+    def _create_commit_approval_ticket(self, dg, score):
+        self.logger.warning(
+            "Commit for %s requires approval (Safe Score: %s)",
+            dg,
+            score,
+        )
+
+    def _calculate_safe_score(self, compliance_failures, risk_scores):
+    
+        score = 100
+    
+        if compliance_failures:
+            score -= 30
+    
+        high_risk_count = sum(1 for r in risk_scores if r >= 8)
+        score -= high_risk_count * 5
+    
+        return max(score, 0)
+
 
     # ===========================================================
     # LOAD
@@ -432,12 +542,42 @@ class PanoramaAdapter(DiffSync):
     def delete_nat_rule(self, m): self._delete(self.client.delete_nat_rule, m, "nat_rule")
 
     # ===========================================================
+    # RULE ORDER OPTIMIZATION
+    # ===========================================================
+    def optimize_rule_moves(self, logical_group, rulebase):
+        if self.drift_only:
+            return
+        current_order = self.client.get_rule_order(logical_group, rulebase)
+        desired = sorted(
+            [
+                r for r in self.get_all("rule")
+                if r.logical_group == logical_group and r.rulebase == rulebase
+            ],
+            key=lambda x: x.position,
+        )
+        desired_order = [r.name for r in desired]
+        for index, rule_name in enumerate(desired_order):
+            if index >= len(current_order) or current_order[index] != rule_name:
+                self.client.move_rule_by_position(
+                    rule_name=rule_name,
+                    logical_group=logical_group,
+                    rulebase=rulebase,
+                    position=index,
+                )
+
+    # ===========================================================
     # FINALIZE (SAFE + FIXED)
     # ===========================================================
     def finalize(self):
 
-        if self.drift_only or self.simulation_mode:
-            self.logger.info("Skipping commit phase (drift/simulation)")
+        if self.drift_only:
+            self.logger.info("Drift-only mode: skipping commit phase")
+            snapshot_id = self._get_forward_snapshot()
+            self._run_compliance_checks()
+            return
+
+        if self.simulation_mode:
+            self.logger.info("Simulation mode: skipping commit phase")
             return
 
         if self.change_window_only:
@@ -445,7 +585,76 @@ class PanoramaAdapter(DiffSync):
             if not (DEFAULT_ALLOWED_HOURS[0] <= hour <= DEFAULT_ALLOWED_HOURS[1]):
                 raise Exception("Outside approved change window")
 
+        # 1 Execute writes
         self.client.execute_batch()
+
+        # 2 Build fresh Forward snapshot
+        snapshot_id = self._get_forward_snapshot()
+
+        # 3 Compliance gate
+        compliance_failures = self._run_compliance_checks()
+        if compliance_failures:
+            self.logger.error("Compliance violations detected: %s", compliance_failures)
+            raise Exception("Compliance validation failed — aborting commit")
+    
+        # 4 Optimize rule order
+        for dg in self.touched_device_groups:
+            self.optimize_rule_moves(dg, "pre")
+            self.optimize_rule_moves(dg, "post")
+    
+        # 5 Advisory + Risk + Blast
+        for dg in self.touched_device_groups:
+    
+            rules = self.client.get_security_rules(dg, "pre")
+            hits = self.client.get_rule_hit_counts(dg)
+    
+            unused = analyze_hit_counts(hits)
+            shadowed = detect_rule_shadowing(rules)
+            consolidation = suggest_rule_consolidation(rules)
+            reorder = suggest_rule_reordering(rules, hits)
+    
+            for rule in rules:
+    
+                impact = self.forward.blast_radius(rule["@name"])
+                blast_size = len(impact)
+    
+                base_risk = calculate_rule_risk(rule)
+                risk = base_risk
+    
+                if blast_size > 0:
+                    self.audit.record(
+                        "blast_radius",
+                        "rule",
+                        rule["@name"],
+                        dg,
+                        extra={"blast_size": blast_size},
+                    )
+    
+                if blast_size > 1000:
+                    risk += 2
+                elif blast_size > 100:
+                    risk += 1
+    
+                if risk >= 8:
+                    self.logger.warning(
+                        "High-risk rule in %s: %s (score=%s, blast=%s)",
+                        dg,
+                        rule["@name"],
+                        risk,
+                        blast_size,
+                    )
+    
+            if unused:
+                self.logger.info("Unused rules in %s: %s", dg, unused)
+    
+            if shadowed:
+                self.logger.warning("Shadowed rules in %s: %s", dg, shadowed)
+    
+            if consolidation:
+                self.logger.info("Consolidation candidates in %s: %s", dg, consolidation)
+    
+            if reorder:
+                self.logger.info("Reorder suggestions in %s: %s", dg, reorder)
 
         compliance_failures = []
         if self.enable_compliance_checks and self.forward:
@@ -472,10 +681,13 @@ class PanoramaAdapter(DiffSync):
         ):
             raise Exception("Safe-to-Commit threshold failed")
 
+
         for dg in self.touched_device_groups:
+
             job_id = self.client.commit_device_group(dg)
             status = self.client.monitor_commit(job_id)
 
             if status != "FIN":
+                self.logger.error("Commit failed in %s — initiating rollback", dg)
                 self.client.rollback_device_group(dg)
-                raise Exception(f"Commit failed in {dg}")
+                raise Exception("Commit failed and rollback executed")
